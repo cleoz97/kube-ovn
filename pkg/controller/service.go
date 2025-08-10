@@ -276,25 +276,57 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 			return nil
 		}
 
-		lb, err := c.OVNNbClient.GetLoadBalancer(lbName, false)
-		if err != nil {
-			klog.Errorf("failed to get LB %s: %v", lbName, err)
-			return err
-		}
-		klog.V(3).Infof("existing vips of LB %s: %v", lbName, lb.Vips)
-		for _, vip := range svcVips {
-			if err := c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
-				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
-				return err
-			}
+		// avoid reading LB.Vips map here to prevent concurrent iteration while endpointSlice worker updates it
 
-			if _, ok := lb.Vips[vip]; !ok {
-				klog.Infof("add vip %s to LB %s", vip, lbName)
-				needUpdateEndpointQueue = true
+		// Ensure endpointSlice processing will add backends for any required VIPs.
+		// Avoid reading lb.Vips concurrently by not checking membership here.
+		if len(svcVips) > 0 {
+			needUpdateEndpointQueue = true
+		}
+
+		// Delete any stale VIPs on current LB determined by service IPs/ports, without iterating lb.Vips
+		for _, ip := range ips {
+			for _, port := range svc.Spec.Ports {
+				// only handle the VIPs for the same protocol as the given lb
+				var lbForPort string
+				switch port.Protocol {
+				case v1.ProtocolTCP:
+					lbForPort = tcpLb
+				case v1.ProtocolUDP:
+					lbForPort = udpLb
+				case v1.ProtocolSCTP:
+					lbForPort = sctpLb
+				}
+				if lbForPort != lbName {
+					continue
+				}
+				vip := util.JoinHostPort(ip, port.Port)
+				if !slices.Contains(svcVips, vip) {
+					klog.Infof("remove stale vip %s from LB %s", vip, lbName)
+					if err := c.OVNNbClient.LoadBalancerDeleteVip(lbName, vip, ignoreHealthCheck); err != nil {
+						klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lbName, err)
+						return err
+					}
+				}
 			}
 		}
-		for vip := range lb.Vips {
-			if ip := parseVipAddr(vip); (slices.Contains(ips, ip) && !slices.Contains(svcVips, vip)) || slices.Contains(ipsToDel, ip) {
+
+		// Delete any VIPs related to IPs that should be removed
+		for _, ip := range ipsToDel {
+			for _, port := range svc.Spec.Ports {
+				var lbForPort string
+				switch port.Protocol {
+				case v1.ProtocolTCP:
+					lbForPort = tcpLb
+				case v1.ProtocolUDP:
+					lbForPort = udpLb
+				case v1.ProtocolSCTP:
+					lbForPort = sctpLb
+				}
+				if lbForPort != lbName {
+					continue
+				}
+				vip := util.JoinHostPort(ip, port.Port)
 				klog.Infof("remove stale vip %s from LB %s", vip, lbName)
 				if err := c.OVNNbClient.LoadBalancerDeleteVip(lbName, vip, ignoreHealthCheck); err != nil {
 					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lbName, err)
@@ -307,16 +339,46 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 			return nil
 		}
 
-		oLb, err := c.OVNNbClient.GetLoadBalancer(oLbName, false)
-		if err != nil {
-			klog.Errorf("failed to get LB %s: %v", oLbName, err)
-			return err
-		}
-		klog.V(3).Infof("existing vips of LB %s: %v", oLbName, lb.Vips)
-		for vip := range oLb.Vips {
-			if ip := parseVipAddr(vip); slices.Contains(ips, ip) || slices.Contains(ipsToDel, ip) {
+		// Delete VIPs from old LB for this service without iterating oLb.Vips
+		for _, ip := range ips {
+			for _, port := range svc.Spec.Ports {
+				var oldLbForPort string
+				switch port.Protocol {
+				case v1.ProtocolTCP:
+					oldLbForPort = oTCPLb
+				case v1.ProtocolUDP:
+					oldLbForPort = oUDPLb
+				case v1.ProtocolSCTP:
+					oldLbForPort = oSctpLb
+				}
+				if oldLbForPort != oLbName {
+					continue
+				}
+				vip := util.JoinHostPort(ip, port.Port)
 				klog.Infof("remove stale vip %s from LB %s", vip, oLbName)
-				if err = c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
+				if err := c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
+					return err
+				}
+			}
+		}
+		for _, ip := range ipsToDel {
+			for _, port := range svc.Spec.Ports {
+				var oldLbForPort string
+				switch port.Protocol {
+				case v1.ProtocolTCP:
+					oldLbForPort = oTCPLb
+				case v1.ProtocolUDP:
+					oldLbForPort = oUDPLb
+				case v1.ProtocolSCTP:
+					oldLbForPort = oSctpLb
+				}
+				if oldLbForPort != oLbName {
+					continue
+				}
+				vip := util.JoinHostPort(ip, port.Port)
+				klog.Infof("remove stale vip %s from LB %s", vip, oLbName)
+				if err := c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
 					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
 					return err
 				}
